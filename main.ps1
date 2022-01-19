@@ -1,18 +1,24 @@
 <#
  .Synopsis
   Get Shared Credential from AWS SSO
-
+ 
  .Description
   Get Shared Credential from AWS SSO
  
  .Parameter accountFilter
-  Array of string for your account filtering. Use wildcard (*) allowed. It is not suggested that you run this without filter. 
+  Array of string for your account filtering. Use wildcard (*) allowed. It is not suggested that you run this without filter if you have many roles.
 
  .Parameter defaultRole
   Which Role do you want to use as your default role. Use the expected nickname such as poc-dx_ReadOnly.
 
- .Example
-  get-ssoroles 
+ .Parameter noLoop
+  If you use this switch then this cmdlet will NOT go into a loop. Do this to get your credential just this once. 
+
+ .Example - Get all the roles and go into a loop, no default role
+  get-ssoRoles 
+
+ .Example - Get only few roles, set example, and no loop
+  get-ssoRoles -accountFilter ("poc*","dev*","prod*") -defaultRole "poc-A_ReadOnly" -noLoop
 #>
 function get-ssoroles{
     param(
@@ -33,8 +39,13 @@ function get-ssoroles{
     write-host "Get AWS SSO Credentials"
     write-host "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-="
     ###########
-    
-    ##This needs to reflect the URL you use when you go to log into AWS SSO
+    try{
+        $version = (get-module -listavailable -name Stifel.CloudAuthenticator.PSModule | sort -Descending)[0].version
+        write-host "Version: $version"
+    }catch{
+        write-host "Could not determine version"
+    }
+    ##This only changes if we have another AWS Organization
     $startUrl = "https://yourapps.awsapps.com/start#/"
 
     ##if noloop is toggled then we need to set this to false AFTER the script runs once
@@ -49,6 +60,12 @@ function get-ssoroles{
 
     ##Your Name goes here
     $myName = $env:UserName
+
+    $region = aws configure get region
+    if ($null -eq $region){
+        write-host "Default region not found. Setting to us-east-1. You're welcome."
+        aws configure set region "us-east-1"
+    }
 
     $tzone = get-timezone
 
@@ -67,7 +84,7 @@ function get-ssoroles{
     }
 
     $skipRegister = $false
-    if($registInfo.clientSecretExpiresAt -ne $null){
+    if($null -ne $registInfo.clientSecretExpiresAt){
         $clientSecretExpire = ((Get-Date 01.01.1970).addHours( - ($tzone.baseutcoffset.totalhours))) + ([System.TimeSpan]::fromseconds($registInfo.clientSecretExpiresAt))
         if ($clientSecretExpire -gt (get-date)){
             $skipRegister = $true
@@ -80,24 +97,33 @@ function get-ssoroles{
     if($skipRegister -eq $false){
         ##Register this device
         try{
-            $registInfoJSON = aws sso-oidc register-client --client-name $myName --client-type "public"
+            $registInfoJSON = aws sso-oidc register-client --client-name $myName --client-type "public" 
         }catch{
             Write-Warning "Register Client error: $($_.Exception.Message)"
         }
+        #parse the content of register Info
+        $registInfo = $registInfoJSON | convertfrom-json
+        # create a securestring then create a text version of it
+        $registInfo.clientSecret = $registInfo.clientSecret | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
 
         try{
-            out-file -FilePath $deviceRegisterFile -InputObject $registInfoJSON -Encoding utf8 -Force
+            out-file -FilePath $deviceRegisterFile -InputObject ($registInfo | convertTo-json) -Encoding utf8 -Force
         }catch{
             Write-Warning "Write to file error: $($_.Exception.Message)"
         }
-        $registInfo = $registInfoJSON | convertfrom-json
+        
         ##somehow this is like good for 3 months?
         $clientSecretExpire = ((Get-Date 01.01.1970).addHours( - ($tzone.baseutcoffset.totalhours))) + ([System.TimeSpan]::fromseconds($registInfo.clientSecretExpiresAt))
         write-host "Register Success"
     }
 
+    
+    #this is encrypted, let's make it into secure string so we can use it
     $clientId = $registInfo.clientId
-    $clientSecret = $registInfo.clientSecret
+    # need to decrypt the register info found in the file and treat it as a secure string
+    $secureClientPassword = $registInfo.clientSecret | ConvertTo-SecureString
+    $clientCredentials = New-Object System.Management.Automation.PSCredential -ArgumentList $clientId, $secureClientPassword 
+    $clientSecret = $clientCredentials.GetNetworkCredential().Password
     write-host "Client ID: $clientId"  
     write-host "This Client will expire on $clientSecretExpire"
     
@@ -119,17 +145,18 @@ function get-ssoroles{
     }
     
     $skipToken = $false
-    if($myToken.expiration -ne $null){
+    if($null -ne $myToken.expiration){
         $tokenExpiresInWhen = (Get-Date 01.01.1970) + ([System.TimeSpan]::fromseconds($myToken.expiration))
         if ($tokenExpiresInWhen -gt (get-date)){
             $skipToken = $true
-            write-host "AccessToken found. Reuse."
+            write-host "AccessToken found."
         }else{
             write-host "AccessToken Expired. Regenerating."
         }
     }
 
     if ($noLoop -eq $false){
+        write-host "Refreshing token at top of loop"
         $skipToken = $false
     }
     #If we're looping, force this
@@ -143,10 +170,11 @@ function get-ssoroles{
         $deviceAuthorization = $deviceAuthorizationJSON | convertfrom-json
 
         $deviceCode = $deviceAuthorization.deviceCode
-        $userCode = $deviceAuthorization.userCode
-        $verificationUri = $deviceAuthorization.verificationUri
-        $verificationUriComplete = $deviceAuthorization.verificationUriComplete
-        $deviceAuthExpiresInSec = $deviceAuthorization.expiresIn
+        #Unused attributes
+        #$userCode = $deviceAuthorization.userCode
+        #$verificationUri = $deviceAuthorization.verificationUri
+        #$verificationUriComplete = $deviceAuthorization.verificationUriComplete
+        #$deviceAuthExpiresInSec = $deviceAuthorization.expiresIn
     
         ##You have 10 minutes to validate yourself here
         write-host "You will now be redirected to a browser to complete your login to SSO. Do so and return here"
@@ -167,6 +195,8 @@ function get-ssoroles{
         $tokenExpiresInSec = $myToken.expiresIn    
         ##Add seconds to current time. This is already in your timezone
         $tokenExpiresInWhen = Get-Date (Get-Date).AddSeconds($tokenExpiresInSec) -UFormat %s
+        #Convert to secure string then show me the string version of it
+        $myToken.accessToken = $myToken.accessToken | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
         $myToken | Add-Member -MemberType NoteProperty -Name 'expiration' -Value $tokenExpiresInWhen
 
         try{
@@ -176,13 +206,18 @@ function get-ssoroles{
         }
         write-host "New AccessToken generated"
     }
-    $accessToken  = $myToken.accessToken
-    $tokenType = $myToken.tokenType
-    $tokenclientExpire = $myToken.clientExpire
-    $tokenExpiresInHour = ($myToken.expiresIn)/3600
+
+    $secureAccessToken = $myToken.accessToken | ConvertTo-SecureString
+    ##username is not important here
+    $tokenCredentials = New-Object System.Management.Automation.PSCredential -ArgumentList $myName, $secureAccessToken 
+    $accessToken = $tokenCredentials.GetNetworkCredential().Password
+    ##These aren't used now
+    #$tokenType = $myToken.tokenType
+    #$tokenclientExpire = $myToken.clientExpire
+    #$tokenExpiresInHour = ($myToken.expiresIn)/3600
     ##This is already in your timezone
     $tokenExpiresInWhen = (Get-Date 01.01.1970) + ([System.TimeSpan]::fromseconds($myToken.expiration))
-    write-host "AccessToken: $($accessToken.substring(0, 10))..."
+    write-host "AccessToken: $($accessToken.substring(0, 5))...$($accessToken.substring(($accessToken.length-6),5))"
     write-host "This AccessToken will expire at $tokenExpiresInWhen."
 
     if ($noLoop -eq $false){
@@ -209,7 +244,8 @@ function get-ssoroles{
                 }
             }
             if( $skipCounter -eq 0){
-                $accountEmail = $account.emailAddress
+                #Unused
+                #$accountEmail = $account.emailAddress
                 #get list of roles in this account
                 $myRolesJSON = aws sso list-account-roles --access-token $accessToken --account-id $accountId
                 $myRoles = ($myRolesJSON | convertfrom-json).roleList
@@ -222,7 +258,8 @@ function get-ssoroles{
                     $accessKeyId = $roleCredentials.accessKeyId
                     $secretAccessKey = $roleCredentials.secretAccessKey
                     $sessionToken = $roleCredentials.sessionToken
-                    $expiration = $roleCredentials.expiration
+                    #Unused
+                    #$expiration = $roleCredentials.expiration
                     $nickname = $accountName + "_" + $roleName
                     try{
                         write-host "Setting $roleName in $accountName as $nickname (SharedCredentialsFile)"
@@ -235,32 +272,35 @@ function get-ssoroles{
                             $newprofile = "[default]" + $myKeys
                             Out-File $tempCredentialFile -InputObject $newprofile -Append -Encoding ascii
                         }
-                        $result = $true
                     }catch{
-                        $result = $false
                         write-host ""
                         Write-Warning "Set Credential error: $($_.Exception.Message)"
                     }
                 }
             }
         }
-        if((Test-Path $backCredentialFile) -eq $true){
-            remove-item $backCredentialFile -Force
+        ##if temp file exists then do this, else skip it all
+        if((Test-Path $tempCredentialFile) -eq $true){
+            if((Test-Path $backCredentialFile) -eq $true){
+                remove-item $backCredentialFile -Force
+            }
+            
+            if((Test-Path $credentialFile) -eq $true){
+                Rename-Item $credentialFile $backCredentialFile -Force 
+            }
+            
+            Rename-Item $tempCredentialFile $credentialFile -Force
+        }else{
+            write-host "No Roles found for you. Please check your filter."
+            $noLoop = $true
         }
-        
-        if((Test-Path $credentialFile) -eq $true){
-            Rename-Item $credentialFile $backCredentialFile -Force 
-        }
-        
-        Rename-Item $tempCredentialFile $credentialFile -Force
 
         if ($noLoop){
             $keepLoop = $false
         }else{
             write-host "---Sleep---"
             ##sleep for 55 mins
-            sleep -Seconds (55 * 60)
+            Start-Sleep -Seconds (55 * 60)
         }
     }
 }
-
